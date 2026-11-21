@@ -35,6 +35,6 @@ python main.py
 
 ## Usage
 
-`/summarize` reads up to 100 recent messages (default 30) and returns bullet points. Bot messages are skipped. The transcript is cut to the latest 10,000 characters so it fits the loaded model context.
+`/summarize` reads up to 100 recent messages (default 30) and returns bullet points. Mentioning the bot with a similar request does the same thing, for example `@bot summarize`, `@bot summary`, `@bot tl;dr`, or `@bot recap 50`. Bot messages are skipped. The transcript is cut to the latest 10,000 characters so it fits the loaded model context.
 
 If the bot runs in WSL and Ollama is listening only on Windows `127.0.0.1`, the request is sent with Windows `curl.exe`.

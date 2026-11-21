@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +16,10 @@ load_dotenv()
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:12b")
 MAX_TRANSCRIPT_CHARS = 10000
+SUMMARIZE_PATTERN = re.compile(
+    r"\b(summari[sz]\w*|tl;?dr|recap)\b",
+    re.IGNORECASE,
+)
 
 
 def ollama_base_url() -> str:
@@ -131,40 +137,87 @@ class SummaryBot(discord.Client):
 bot = SummaryBot()
 
 
-@bot.tree.command(name="summarize", description="Summarize recent messages in this channel")
-@app_commands.describe(limit="Number of recent messages to summarize (max 100)")
-async def summarize(interaction: discord.Interaction, limit: int = 30):
-    await interaction.response.defer(thinking=True)
-    limit = max(1, min(limit, 100))
+def clamp_limit(limit: int) -> int:
+    return max(1, min(limit, 100))
 
-    messages = [msg async for msg in interaction.channel.history(limit=limit)]
-    messages.reverse()
 
-    transcript = "\n".join(
-        f"{m.author.display_name}: {m.content}"
-        for m in messages
-        if m.content and not m.author.bot
-    )
-
-    if not transcript:
-        await interaction.followup.send("No text messages found to summarize.")
-        return
-
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[-MAX_TRANSCRIPT_CHARS:]
-
-    prompt = (
+def summary_prompt(transcript: str) -> str:
+    return (
         "Summarize this Discord chat log into concise bullet points covering "
         "key topics, decisions, and notable moments:\n\n" + transcript
     )
 
+
+async def channel_transcript(channel, limit: int, skip_message_id: int | None = None) -> str:
+    messages = [msg async for msg in channel.history(limit=limit)]
+    messages.reverse()
+    lines = [
+        f"{msg.author.display_name}: {msg.content}"
+        for msg in messages
+        if msg.id != skip_message_id and msg.content and not msg.author.bot
+    ]
+    transcript = "\n".join(lines)
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        transcript = transcript[-MAX_TRANSCRIPT_CHARS:]
+    return transcript
+
+
+async def summarize_transcript(transcript: str) -> str:
+    return await asyncio.to_thread(ollama_generate, summary_prompt(transcript))
+
+
+def mention_asks_for_summary(content: str) -> int | None:
+    text = re.sub(r"<@!?\d+>", " ", content)
+    if not SUMMARIZE_PATTERN.search(text):
+        return None
+    count = re.search(r"\b(\d{1,3})\b", text)
+    if count is None:
+        return 30
+    return clamp_limit(int(count.group(1)))
+
+
+@bot.tree.command(name="summarize", description="Summarize recent messages in this channel")
+@app_commands.describe(limit="Number of recent messages to summarize (max 100)")
+async def summarize(interaction: discord.Interaction, limit: int = 30):
+    await interaction.response.defer(thinking=True)
+    transcript = await channel_transcript(interaction.channel, clamp_limit(limit))
+    if not transcript:
+        await interaction.followup.send("No text messages found to summarize.")
+        return
+
     try:
-        summary = ollama_generate(prompt)
+        summary = await summarize_transcript(transcript)
     except Exception as error:
         await interaction.followup.send(f"Summarize failed: {error}"[:1950])
         return
 
     await interaction.followup.send(summary[:1950])
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or bot.user not in message.mentions:
+        return
+    limit = mention_asks_for_summary(message.content)
+    if limit is None:
+        return
+
+    async with message.channel.typing():
+        transcript = await channel_transcript(
+            message.channel,
+            limit,
+            skip_message_id=message.id,
+        )
+        if not transcript:
+            await message.reply("No text messages found to summarize.")
+            return
+        try:
+            summary = await summarize_transcript(transcript)
+        except Exception as error:
+            await message.reply(f"Summarize failed: {error}"[:1950])
+            return
+
+    await message.reply(summary[:1950])
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
